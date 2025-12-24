@@ -1,0 +1,29 @@
+# Patch train_instruct.py to support medium config
+import re
+
+with open('train_instruct.py', 'r') as f:
+    code = f.read()
+
+# Fix import (exact match for this file)
+code = code.replace(
+    'from model import Chimera, chimera_small, chimera_base',
+    'from model import Chimera, chimera_small, chimera_medium, chimera_base, chimera_large'
+)
+
+# Fix choices
+code = code.replace(
+    'choices=["small", "base"]',
+    'choices=["small", "medium", "base", "large"]'
+)
+
+# Fix config dict
+code = re.sub(
+    r'"small":\s*chimera_small,\s*"base":\s*chimera_base,?',
+    '"small": chimera_small, "medium": chimera_medium, "base": chimera_base, "large": chimera_large,',
+    code
+)
+
+with open('train_instruct.py', 'w') as f:
+    f.write(code)
+
+print("Patched train_instruct.py!")

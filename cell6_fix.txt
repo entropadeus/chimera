@@ -1,0 +1,32 @@
+#@title 6. Extract Model Weights { display-mode: "form" }
+
+import os
+os.chdir('/content/chimera')
+import torch
+from train_packed import TrainConfig
+
+print("=" * 50)
+print("EXTRACTING MODEL WEIGHTS")
+print("=" * 50)
+
+# Find latest checkpoint
+if os.path.exists('checkpoints/latest.pt'):
+    ckpt_path = 'checkpoints/latest.pt'
+elif os.path.exists('checkpoints'):
+    ckpts = [f for f in os.listdir('checkpoints') if f.startswith('step_')]
+    if ckpts:
+        ckpt_path = f'checkpoints/{sorted(ckpts)[-1]}'
+    else:
+        raise SystemExit("No checkpoints found!")
+else:
+    raise SystemExit("No checkpoints directory!")
+
+print(f"Loading {ckpt_path}...")
+ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+
+print(f"Step: {ckpt.get('step', '?')}")
+
+# Save just model weights
+torch.save(ckpt['model'], 'checkpoints/medium_pretrained.pt')
+print("\n Saved to checkpoints/medium_pretrained.pt")
+!ls -lh checkpoints/medium_pretrained.pt

@@ -1,0 +1,14 @@
+#@title 7. Test Generation { display-mode: "form" }
+
+import os
+os.chdir('/content/chimera')
+
+print("=" * 50)
+print("TESTING GENERATION")
+print("=" * 50)
+
+!python generate.py \
+    --checkpoint checkpoints/medium_pretrained.pt \
+    --config medium \
+    --prompt "Once upon a time, there was a little rabbit" \
+    --max-tokens 150

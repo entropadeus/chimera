@@ -1,0 +1,24 @@
+# Fix compiled model checkpoint (removes _orig_mod. prefix)
+import torch
+
+ckpt_path = 'checkpoints/medium_pretrained.pt'
+print(f"Loading {ckpt_path}...")
+
+state_dict = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+
+# Check if it has the _orig_mod prefix
+if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+    print("Found _orig_mod. prefix from torch.compile, removing...")
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        new_key = k.replace('_orig_mod.', '')
+        new_state_dict[new_key] = v
+    state_dict = new_state_dict
+
+    # Save fixed checkpoint
+    torch.save(state_dict, ckpt_path)
+    print(f"Saved fixed checkpoint to {ckpt_path}")
+else:
+    print("Checkpoint already clean, no fix needed")
+
+print("Done!")

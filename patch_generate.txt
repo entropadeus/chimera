@@ -1,0 +1,29 @@
+# Patch generate.py to support medium config
+import re
+
+with open('generate.py', 'r') as f:
+    code = f.read()
+
+# Fix import
+code = code.replace(
+    'from model import Chimera, ChimeraConfig, chimera_small, chimera_base',
+    'from model import Chimera, ChimeraConfig, chimera_small, chimera_medium, chimera_base, chimera_large'
+)
+
+# Fix choices
+code = code.replace(
+    'choices=["small", "base"]',
+    'choices=["small", "medium", "base", "large"]'
+)
+
+# Fix config dict (use regex for multiline)
+code = re.sub(
+    r'"small": chimera_small,\s*"base": chimera_base,',
+    '"small": chimera_small, "medium": chimera_medium, "base": chimera_base, "large": chimera_large,',
+    code
+)
+
+with open('generate.py', 'w') as f:
+    f.write(code)
+
+print("Patched generate.py!")

@@ -1,0 +1,13 @@
+# Chimera LLM Requirements
+# Core (required)
+torch>=2.0.0
+
+# Tokenizer (recommended)
+transformers>=4.30.0
+
+# Training (optional)
+wandb>=0.15.0
+
+# Development (optional)
+pytest>=7.0.0
+black>=23.0.0

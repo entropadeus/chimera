@@ -150,24 +150,40 @@ class SwiGLU(nn.Module):
 
 class GatedLinearRecurrence(nn.Module):
     """
-    Real-Gated Linear Recurrent Unit (RG-LRU) inspired by Griffin.
+    Real-Gated Linear Recurrent Unit (RG-LRU) - Griffin-accurate implementation.
 
-    Key innovation: Uses real-valued gated recurrence for O(1) memory during inference.
-    This handles global context efficiently while attention handles local precision.
+    Key innovations from Griffin paper (arxiv.org/abs/2402.19427):
+    - TWO gates: recurrence gate (r_t) AND input gate (i_t)
+    - Learned base recurrence rate: a = σ(Λ), then a_t = a^(c·r_t)
+    - Log-space computation for numerical stability
+    - Special initialization for long-range memory (0.9-0.999 range)
 
-    Recurrence: h_t = a_t * h_{t-1} + sqrt(1 - a_t^2) * x_t
-    Where a_t = sigmoid(gate) is the recurrence gate.
+    Recurrence: h_t = a_t ⊙ h_{t-1} + √(1-a_t²) ⊙ (i_t ⊙ x_t)
     """
 
-    def __init__(self, d_model: int, expansion: int = 1):
+    def __init__(self, d_model: int, expansion: int = 1, c: float = 8.0):
         super().__init__()
         self.d_model = d_model
         self.hidden_dim = d_model * expansion
+        self.c = c  # Gate scaling constant (Griffin uses 8)
 
-        # Input projections
-        self.input_proj = nn.Linear(d_model, self.hidden_dim * 2, bias=False)
-        # Gate for recurrence (how much to remember vs update)
-        self.gate_proj = nn.Linear(d_model, self.hidden_dim, bias=True)
+        # Input projection (for x_t that enters the state)
+        self.input_proj = nn.Linear(d_model, self.hidden_dim, bias=False)
+
+        # Input gate i_t - controls WHAT new info enters (Griffin's key insight)
+        self.input_gate_proj = nn.Linear(d_model, self.hidden_dim, bias=True)
+
+        # Recurrence gate r_t - controls HOW MUCH old state to keep
+        self.recurrence_gate_proj = nn.Linear(d_model, self.hidden_dim, bias=True)
+
+        # Learned base recurrence rate: a = σ(Λ) per dimension
+        # Initialize Λ so a^c is uniform in [0.9, 0.999] for long memory
+        # a^c in [0.9, 0.999] => a in [0.9^(1/c), 0.999^(1/c)]
+        # For c=8: a in [0.987, 0.99987] => Λ in [4.3, 9.1] approx
+        # We initialize Λ uniform in this range, then σ(Λ) gives our base rates
+        lambda_init = torch.empty(self.hidden_dim).uniform_(4.0, 9.0)
+        self.lambda_param = nn.Parameter(lambda_init)
+
         # Output projection
         self.output_proj = nn.Linear(self.hidden_dim, d_model, bias=False)
 
@@ -176,6 +192,23 @@ class GatedLinearRecurrence(nn.Module):
 
         # Layer norm for stability
         self.norm = RMSNorm(self.hidden_dim)
+
+    def _compute_a_t(self, r_t: torch.Tensor) -> torch.Tensor:
+        """
+        Compute recurrence coefficient a_t = a^(c·r_t) in log-space for stability.
+
+        a = σ(Λ) is the learned base rate per dimension
+        r_t = σ(recurrence_gate) modulates it per timestep
+        """
+        # Base recurrence rate (learned per dimension)
+        a = torch.sigmoid(self.lambda_param)  # [hidden_dim]
+
+        # Compute a^(c·r_t) in log-space: exp(c·r_t·log(a))
+        log_a = torch.log(a + 1e-8)  # [hidden_dim]
+        # r_t is [batch, seq, hidden_dim], scale by c and multiply by log_a
+        a_t = torch.exp(self.c * r_t * log_a)  # [batch, seq, hidden_dim]
+
+        return a_t
 
     def forward(self, x: torch.Tensor,
                 recurrence_state: Optional[torch.Tensor] = None,
@@ -194,13 +227,15 @@ class GatedLinearRecurrence(nn.Module):
         """
         batch_size, seq_len, _ = x.shape
 
-        # Project input and split into update/gate
-        proj = self.input_proj(x)
-        update, gate_input = proj.chunk(2, dim=-1)
+        # Project input
+        x_proj = self.input_proj(x)  # [batch, seq, hidden_dim]
 
-        # Compute recurrence gate (sigmoid for stability)
-        gate = self.gate_proj(x)
-        a = torch.sigmoid(gate)  # Recurrence coefficient in [0, 1]
+        # Compute gates
+        i_t = torch.sigmoid(self.input_gate_proj(x))  # Input gate
+        r_t = torch.sigmoid(self.recurrence_gate_proj(x))  # Recurrence gate
+
+        # Compute recurrence coefficient a_t = a^(c·r_t)
+        a_t = self._compute_a_t(r_t)
 
         # Initialize hidden state
         if recurrence_state is None:
@@ -211,12 +246,15 @@ class GatedLinearRecurrence(nn.Module):
         # Process sequence
         outputs = []
         for t in range(seq_len):
-            x_t = update[:, t:t+1, :]
-            a_t = a[:, t:t+1, :]
+            x_t = x_proj[:, t:t+1, :]
+            i_t_step = i_t[:, t:t+1, :]
+            a_t_step = a_t[:, t:t+1, :]
 
-            # Gated linear recurrence: h_t = a_t * h_{t-1} + sqrt(1 - a_t^2) * x_t
-            # The sqrt(1 - a^2) factor ensures the recurrence is norm-preserving
-            h = a_t * h + torch.sqrt(1 - a_t.pow(2) + 1e-6) * x_t
+            # Griffin recurrence: h_t = a_t ⊙ h_{t-1} + √(1-a_t²) ⊙ (i_t ⊙ x_t)
+            # The input gate i_t selectively filters what new info enters
+            # The sqrt(1-a²) factor ensures norm preservation
+            gated_input = i_t_step * x_t
+            h = a_t_step * h + torch.sqrt(1 - a_t_step.pow(2) + 1e-6) * gated_input
             outputs.append(h)
 
         # Stack outputs
@@ -230,30 +268,34 @@ class GatedLinearRecurrence(nn.Module):
     def forward_parallel(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parallelized forward pass for training (no sequential bottleneck).
-        Uses associative scan for O(n) parallel computation.
+        Uses associative scan approximation for O(n) parallel computation.
         """
         batch_size, seq_len, _ = x.shape
 
-        proj = self.input_proj(x)
-        update, _ = proj.chunk(2, dim=-1)
+        # Project input
+        x_proj = self.input_proj(x)
 
-        gate = self.gate_proj(x)
-        a = torch.sigmoid(gate)
+        # Compute gates
+        i_t = torch.sigmoid(self.input_gate_proj(x))
+        r_t = torch.sigmoid(self.recurrence_gate_proj(x))
 
-        # For training, we use a simplified parallel form
-        # This is an approximation that works well in practice
-        # Full associative scan would be more accurate but complex
+        # Compute a_t
+        a_t = self._compute_a_t(r_t)
 
-        # Compute cumulative product of gates (parallel prefix)
-        log_a = torch.log(a + 1e-6)
+        # Apply input gate to projected input
+        gated_input = i_t * x_proj
+
+        # Parallel scan approximation
+        # Compute cumulative product of a_t (in log-space for stability)
+        log_a = torch.log(a_t + 1e-8)
         cumsum_log_a = torch.cumsum(log_a, dim=1)
         a_cumulative = torch.exp(cumsum_log_a)
 
-        # Weighted sum of inputs
-        sqrt_complement = torch.sqrt(1 - a.pow(2) + 1e-6)
-        weighted_input = sqrt_complement * update
+        # Weighted sum with sqrt complement
+        sqrt_complement = torch.sqrt(1 - a_t.pow(2) + 1e-6)
+        weighted_input = sqrt_complement * gated_input
 
-        # Compute via cumsum trick (approximation for efficiency)
+        # Compute via cumsum trick
         output = torch.cumsum(weighted_input / (a_cumulative + 1e-6), dim=1) * a_cumulative
 
         output = self.norm(output)

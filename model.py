@@ -1,21 +1,22 @@
 """
-Chimera: A Novel Hybrid LLM Architecture
-=========================================
-Combines proven innovations from 2023-2025 research:
-- Gated Linear Recurrence (RG-LRU from Griffin) for O(1) memory global context
-- Sliding Window GQA for local retrieval precision
-- SwiGLU FFN (standard in Llama/Mistral/PaLM)
-- RoPE with NTK-aware scaling for long context
-- 3:1 Recurrent:Attention layer ratio (proven in Jamba/Griffin)
+Transformer: A Clean Implementation from Scratch
+=================================================
+A tried-and-true decoder-only transformer with modern best practices.
 
-Target: ~1.5B params for laptop inference (CPU/consumer GPU)
+Architecture:
+- Pre-norm residual connections (RMSNorm)
+- Multi-head self-attention with causal masking
+- Rotary Position Embeddings (RoPE)
+- SwiGLU feed-forward network
+- Optional Grouped Query Attention (GQA) for efficiency
+- Weight tying between embedding and output
 
-References:
-- Griffin: arxiv.org/abs/2402.19427
-- Mamba: arxiv.org/abs/2312.00752
-- GQA: arxiv.org/abs/2305.13245
-- SwiGLU: arxiv.org/abs/2002.05202
-- RoPE/YaRN: arxiv.org/abs/2309.00071
+Based on the proven architecture from:
+- GPT-2/3 (decoder-only autoregressive)
+- Llama 1/2/3 (RMSNorm, RoPE, SwiGLU, GQA)
+- Mistral (sliding window optional, GQA)
+
+This is the architecture that powers most modern LLMs.
 """
 
 import math
@@ -28,35 +29,40 @@ import torch.nn.functional as F
 
 
 @dataclass
-class ChimeraConfig:
-    """Configuration for Chimera model."""
-    d_model: int = 2048
-    n_layers: int = 24
+class TransformerConfig:
+    """Configuration for the Transformer model."""
+    d_model: int = 1024
+    n_layers: int = 16
     n_heads: int = 16
-    n_kv_heads: int = 4  # GQA: fewer KV heads than query heads
+    n_kv_heads: int = 4  # For GQA (set equal to n_heads for standard MHA)
     vocab_size: int = 32000
-    max_seq_len: int = 8192
-    sliding_window: int = 512  # Local attention window
-    ffn_hidden_mult: float = 8/3  # SwiGLU uses 8/3 ratio
+    max_seq_len: int = 2048
+    ffn_hidden_mult: float = 8/3  # SwiGLU uses 8/3 ratio (standard)
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
-    rope_scaling: Optional[float] = None  # NTK-aware scaling factor
     dropout: float = 0.0
-    recurrence_dim: int = None  # Defaults to d_model if None
-    attention_every_n: int = 3  # Place attention layer every N layers
     tie_word_embeddings: bool = True
 
     def __post_init__(self):
-        if self.recurrence_dim is None:
-            self.recurrence_dim = self.d_model
         self.ffn_hidden = int(self.d_model * self.ffn_hidden_mult)
         # Round to nearest multiple of 256 for efficiency
         self.ffn_hidden = ((self.ffn_hidden + 255) // 256) * 256
         self.head_dim = self.d_model // self.n_heads
+        assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+        assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
+
+
+# Backward compatibility alias
+ChimeraConfig = TransformerConfig
 
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization (more efficient than LayerNorm)."""
+    """
+    Root Mean Square Layer Normalization.
+
+    More efficient than LayerNorm (no mean subtraction, no bias).
+    Used in Llama, Mistral, and most modern LLMs.
+    """
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -64,32 +70,29 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # float32 for stability, then cast back
         dtype = x.dtype
         x = x.float()
-        norm = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (norm * self.weight).to(dtype)
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x * rms * self.weight).to(dtype)
 
 
 class RotaryEmbedding(nn.Module):
-    """Rotary Position Embedding with optional NTK-aware scaling."""
+    """
+    Rotary Position Embedding (RoPE).
 
-    def __init__(self, dim: int, max_seq_len: int = 8192,
-                 theta: float = 10000.0, scaling: Optional[float] = None):
+    Encodes position information by rotating query/key vectors.
+    Benefits: relative position awareness, extrapolates to longer sequences.
+    Used in Llama, Mistral, PaLM, and most modern LLMs.
+    """
+
+    def __init__(self, dim: int, max_seq_len: int = 2048, theta: float = 10000.0):
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.theta = theta
-        self.scaling = scaling
 
         # Compute inverse frequencies
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-
-        # Apply NTK-aware scaling if specified
-        if scaling is not None and scaling > 1.0:
-            # Scale base frequency for NTK-aware interpolation
-            inv_freq = inv_freq / (scaling ** (dim / (dim - 2)))
-
         self.register_buffer("inv_freq", inv_freq)
         self._build_cache(max_seq_len)
 
@@ -97,13 +100,12 @@ class RotaryEmbedding(nn.Module):
         """Pre-compute cos/sin cache for efficiency."""
         t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq)
-        # Duplicate for real/imag pairs
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
-    def forward(self, x: torch.Tensor, seq_len: int, offset: int = 0):
-        """Apply rotary embeddings to input tensor."""
+    def forward(self, seq_len: int, offset: int = 0):
+        """Return cos/sin for the given sequence length."""
         if seq_len + offset > self.cos_cached.size(0):
             self._build_cache(seq_len + offset)
 
@@ -113,17 +115,21 @@ class RotaryEmbedding(nn.Module):
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Rotate half the hidden dims of the input."""
+    """Rotate half the hidden dims of the input (for RoPE)."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor,
-                          cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary position embeddings to queries and keys."""
-    # Reshape cos/sin for broadcasting
-    cos = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, dim]
+    # cos/sin are [seq_len, head_dim], need to broadcast to [batch, heads, seq_len, head_dim]
+    cos = cos.unsqueeze(0).unsqueeze(0)
     sin = sin.unsqueeze(0).unsqueeze(0)
 
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -132,335 +138,135 @@ def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor,
 
 
 class SwiGLU(nn.Module):
-    """SwiGLU activation for FFN - standard in Llama/Mistral/PaLM."""
+    """
+    SwiGLU Feed-Forward Network.
+
+    Formula: (Swish(xW1) * xW3) @ W2
+
+    The gated linear unit with Swish activation.
+    Empirically better than GELU FFN at same parameter count.
+    Used in Llama, Mistral, PaLM.
+    """
 
     def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
-        self.w1 = nn.Linear(d_model, hidden_dim, bias=False)  # Gate projection
-        self.w2 = nn.Linear(hidden_dim, d_model, bias=False)  # Down projection
-        self.w3 = nn.Linear(d_model, hidden_dim, bias=False)  # Up projection
+        self.gate_proj = nn.Linear(d_model, hidden_dim, bias=False)
+        self.up_proj = nn.Linear(d_model, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, d_model, bias=False)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # SwiGLU: (Swish(xW1) ⊙ xW3) W2
-        gate = F.silu(self.w1(x))  # Swish activation
-        up = self.w3(x)
-        return self.dropout(self.w2(gate * up))
+        gate = F.silu(self.gate_proj(x))  # Swish activation
+        up = self.up_proj(x)
+        return self.dropout(self.down_proj(gate * up))
 
 
-class GatedLinearRecurrence(nn.Module):
+class Attention(nn.Module):
     """
-    Real-Gated Linear Recurrent Unit (RG-LRU) - Griffin-accurate implementation.
+    Multi-Head Self-Attention with optional Grouped Query Attention (GQA).
 
-    Key innovations from Griffin paper (arxiv.org/abs/2402.19427):
-    - TWO gates: recurrence gate (r_t) AND input gate (i_t)
-    - Learned base recurrence rate: a = σ(Λ), then a_t = a^(c·r_t)
-    - Log-space computation for numerical stability
-    - Special initialization for long-range memory (0.9-0.999 range)
+    Features:
+    - Causal (autoregressive) masking
+    - RoPE position encoding
+    - GQA for memory efficiency (set n_kv_heads < n_heads)
+    - KV-cache for efficient inference
 
-    Recurrence: h_t = a_t ⊙ h_{t-1} + √(1-a_t²) ⊙ (i_t ⊙ x_t)
-    """
-
-    def __init__(self, d_model: int, expansion: int = 1, c: float = 8.0):
-        super().__init__()
-        self.d_model = d_model
-        self.hidden_dim = d_model * expansion
-        self.c = c  # Gate scaling constant (Griffin uses 8)
-
-        # Input projection (for x_t that enters the state)
-        self.input_proj = nn.Linear(d_model, self.hidden_dim, bias=False)
-
-        # Input gate i_t - controls WHAT new info enters (Griffin's key insight)
-        self.input_gate_proj = nn.Linear(d_model, self.hidden_dim, bias=True)
-
-        # Recurrence gate r_t - controls HOW MUCH old state to keep
-        self.recurrence_gate_proj = nn.Linear(d_model, self.hidden_dim, bias=True)
-
-        # Learned base recurrence rate: a = σ(Λ) per dimension
-        # Initialize Λ so a^c is uniform in [0.9, 0.999] for long memory
-        # a^c in [0.9, 0.999] => a in [0.9^(1/c), 0.999^(1/c)]
-        # For c=8: a in [0.987, 0.99987] => Λ in [4.3, 9.1] approx
-        # We initialize Λ uniform in this range, then σ(Λ) gives our base rates
-        lambda_init = torch.empty(self.hidden_dim).uniform_(4.0, 9.0)
-        self.lambda_param = nn.Parameter(lambda_init)
-
-        # Output projection
-        self.output_proj = nn.Linear(self.hidden_dim, d_model, bias=False)
-
-        # Learnable initial state
-        self.h0 = nn.Parameter(torch.zeros(1, 1, self.hidden_dim))
-
-        # Layer norm for stability
-        self.norm = RMSNorm(self.hidden_dim)
-
-    def _compute_a_t(self, r_t: torch.Tensor) -> torch.Tensor:
-        """
-        Compute recurrence coefficient a_t = a^(c·r_t) in log-space for stability.
-
-        a = σ(Λ) is the learned base rate per dimension
-        r_t = σ(recurrence_gate) modulates it per timestep
-        """
-        # Base recurrence rate (learned per dimension)
-        a = torch.sigmoid(self.lambda_param)  # [hidden_dim]
-
-        # Compute a^(c·r_t) in log-space: exp(c·r_t·log(a))
-        log_a = torch.log(a + 1e-8)  # [hidden_dim]
-        # r_t is [batch, seq, hidden_dim], scale by c and multiply by log_a
-        a_t = torch.exp(self.c * r_t * log_a)  # [batch, seq, hidden_dim]
-
-        return a_t
-
-    def forward(self, x: torch.Tensor,
-                recurrence_state: Optional[torch.Tensor] = None,
-                use_cache: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass with optional cached state for inference.
-
-        Args:
-            x: Input tensor [batch, seq_len, d_model]
-            recurrence_state: Previous hidden state [batch, 1, hidden_dim]
-            use_cache: Whether to return updated state for caching
-
-        Returns:
-            output: [batch, seq_len, d_model]
-            new_state: Updated recurrence state if use_cache else None
-        """
-        batch_size, seq_len, _ = x.shape
-
-        # Project input
-        x_proj = self.input_proj(x)  # [batch, seq, hidden_dim]
-
-        # Compute gates
-        i_t = torch.sigmoid(self.input_gate_proj(x))  # Input gate
-        r_t = torch.sigmoid(self.recurrence_gate_proj(x))  # Recurrence gate
-
-        # Compute recurrence coefficient a_t = a^(c·r_t)
-        a_t = self._compute_a_t(r_t)
-
-        # Initialize hidden state
-        if recurrence_state is None:
-            h = self.h0.expand(batch_size, 1, -1)
-        else:
-            h = recurrence_state
-
-        # Process sequence
-        outputs = []
-        for t in range(seq_len):
-            x_t = x_proj[:, t:t+1, :]
-            i_t_step = i_t[:, t:t+1, :]
-            a_t_step = a_t[:, t:t+1, :]
-
-            # Griffin recurrence: h_t = a_t ⊙ h_{t-1} + √(1-a_t²) ⊙ (i_t ⊙ x_t)
-            # The input gate i_t selectively filters what new info enters
-            # The sqrt(1-a²) factor ensures norm preservation
-            gated_input = i_t_step * x_t
-            h = a_t_step * h + torch.sqrt(1 - a_t_step.pow(2) + 1e-6) * gated_input
-            outputs.append(h)
-
-        # Stack outputs
-        output = torch.cat(outputs, dim=1)
-        output = self.norm(output)
-        output = self.output_proj(output)
-
-        new_state = h if use_cache else None
-        return output, new_state
-
-    def forward_parallel(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Parallelized forward pass for training (no sequential bottleneck).
-        Uses parallel scan for O(n log n) computation instead of O(n) sequential.
-        """
-        batch_size, seq_len, _ = x.shape
-
-        # Project input
-        x_proj = self.input_proj(x)
-
-        # Compute gates
-        i_t = torch.sigmoid(self.input_gate_proj(x))
-        r_t = torch.sigmoid(self.recurrence_gate_proj(x))
-
-        # Compute a_t
-        a_t = self._compute_a_t(r_t)
-
-        # Apply input gate to projected input
-        gated_input = i_t * x_proj
-
-        # Sqrt complement for norm preservation
-        sqrt_complement = torch.sqrt(1 - a_t.pow(2) + 1e-6)
-        weighted_input = sqrt_complement * gated_input
-
-        # Parallel scan using associative property
-        # h_t = a_t * h_{t-1} + b_t where b_t = sqrt_complement * gated_input
-        # This can be computed via parallel prefix sum
-        output = self._parallel_scan(a_t, weighted_input)
-
-        output = self.norm(output)
-        output = self.output_proj(output)
-
-        return output
-
-    def _parallel_scan(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """
-        Parallel scan for linear recurrence: h_t = a_t * h_{t-1} + b_t
-
-        Uses the associative property: (a1, b1) ⊗ (a2, b2) = (a1*a2, a2*b1 + b2)
-
-        IMPORTANT: Must use float32 internally - bf16 loses precision over long
-        sequences when computing cumulative products (0.99^2048 ≈ 1e-9).
-        """
-        orig_dtype = a.dtype
-
-        # Cast to float32 for numerical stability
-        a = a.float()
-        b = b.float()
-
-        # Compute cumulative product of a in log-space for stability
-        log_a = torch.log(a + 1e-8)
-        cumsum_log_a = torch.cumsum(log_a, dim=1)
-        a_cumulative = torch.exp(cumsum_log_a)  # [batch, seq, hidden]
-
-        # Scale inputs by inverse cumulative product, cumsum, then rescale
-        # h_t = sum_{i=1}^{t} (prod_{j=i+1}^{t} a_j) * b_i
-        #     = a_cumulative_t * sum_{i=1}^{t} b_i / a_cumulative_i
-
-        # Compute b / a_cumulative (shifted by 1 for correct indexing)
-        a_cumulative_safe = a_cumulative + 1e-8
-        scaled_b = b / a_cumulative_safe
-
-        # Cumulative sum of scaled inputs
-        cumsum_scaled = torch.cumsum(scaled_b, dim=1)
-
-        # Rescale by cumulative product
-        output = cumsum_scaled * a_cumulative
-
-        return output.to(orig_dtype)
-
-
-class SlidingWindowGQA(nn.Module):
-    """
-    Grouped-Query Attention with Sliding Window.
-
-    Combines:
-    - GQA (fewer KV heads) for memory efficiency
-    - Sliding window for local attention (no global KV cache needed)
-    - RoPE for position encoding
+    GQA groups multiple query heads to share the same key-value heads,
+    reducing KV-cache memory with minimal quality loss.
     """
 
-    def __init__(self, config: ChimeraConfig):
+    def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads
         self.head_dim = config.head_dim
-        self.window_size = config.sliding_window
+        self.n_rep = self.n_heads // self.n_kv_heads  # GQA repeat factor
 
-        # GQA: n_heads queries, n_kv_heads key-values
-        self.n_rep = self.n_heads // self.n_kv_heads  # Repeat factor
-
+        # Projections
         self.q_proj = nn.Linear(config.d_model, self.n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(config.d_model, self.n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.d_model, self.n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, config.d_model, bias=False)
 
-        self.rotary = RotaryEmbedding(
-            self.head_dim,
-            config.max_seq_len,
-            config.rope_theta,
-            config.rope_scaling
-        )
+        # RoPE
+        self.rotary = RotaryEmbedding(self.head_dim, config.max_seq_len, config.rope_theta)
 
         self.dropout = nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
 
     def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
         """Repeat KV heads to match query heads for GQA."""
-        batch, seq_len, n_kv_heads, head_dim = x.shape
+        batch, n_kv_heads, seq_len, head_dim = x.shape
         if self.n_rep == 1:
             return x
-        x = x[:, :, :, None, :].expand(batch, seq_len, n_kv_heads, self.n_rep, head_dim)
-        return x.reshape(batch, seq_len, self.n_heads, head_dim)
+        x = x[:, :, None, :, :].expand(batch, n_kv_heads, self.n_rep, seq_len, head_dim)
+        return x.reshape(batch, self.n_heads, seq_len, head_dim)
 
-    def forward(self, x: torch.Tensor,
-                kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                position_offset: int = 0,
-                use_cache: bool = False) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        position_offset: int = 0,
+        use_cache: bool = False
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
-        Forward pass with sliding window attention and optional KV cache.
+        Forward pass with optional KV-cache for inference.
 
-        The sliding window limits attention to local context, keeping memory bounded.
+        Args:
+            x: Input tensor [batch, seq_len, d_model]
+            kv_cache: Cached (keys, values) from previous steps
+            position_offset: Position offset for RoPE (for cached inference)
+            use_cache: Whether to return updated KV-cache
+
+        Returns:
+            output: [batch, seq_len, d_model]
+            new_cache: Updated KV-cache if use_cache else None
         """
         batch_size, seq_len, _ = x.shape
 
-        # Project to queries, keys, values
+        # Project to Q, K, V
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim)
         k = self.k_proj(x).view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
 
-        # Apply rotary embeddings
-        cos, sin = self.rotary(x, seq_len, position_offset)
-        q_rot = q.transpose(1, 2)  # [batch, heads, seq, dim]
-        k_rot = k.transpose(1, 2)
+        # Transpose to [batch, heads, seq, dim]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
-        # Reshape for RoPE application
-        q_rot = q_rot.reshape(batch_size * self.n_heads, seq_len, self.head_dim)
-        k_rot = k_rot.reshape(batch_size * self.n_kv_heads, seq_len, self.head_dim)
+        # Apply RoPE
+        cos, sin = self.rotary(seq_len, position_offset)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        q_rot, k_rot = apply_rotary_pos_emb(q_rot.unsqueeze(0), k_rot.unsqueeze(0), cos, sin)
-
-        q = q_rot.squeeze(0).view(batch_size, self.n_heads, seq_len, self.head_dim)
-        k = k_rot.squeeze(0).view(batch_size, self.n_kv_heads, seq_len, self.head_dim)
-        v = v.transpose(1, 2)  # [batch, kv_heads, seq, dim]
-
-        # Handle KV cache for inference
+        # Handle KV cache
         if kv_cache is not None:
             cache_k, cache_v = kv_cache
             k = torch.cat([cache_k, k], dim=2)
             v = torch.cat([cache_v, v], dim=2)
 
-        kv_len = k.size(2)
-
-        # For inference with cache: trim to window size
-        # For training: keep full KV, use sliding window mask instead
-        if use_cache and kv_len > self.window_size:
-            k = k[:, :, -self.window_size:, :]
-            v = v[:, :, -self.window_size:, :]
-            kv_len = self.window_size
-
         new_cache = (k, v) if use_cache else None
 
-        # Repeat KV heads to match query heads (GQA)
-        k = self._repeat_kv(k.transpose(1, 2)).transpose(1, 2)
-        v = self._repeat_kv(v.transpose(1, 2)).transpose(1, 2)
+        # Repeat KV heads for GQA
+        k = self._repeat_kv(k)
+        v = self._repeat_kv(v)
 
         # Scaled dot-product attention
         scale = 1.0 / math.sqrt(self.head_dim)
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
 
-        # Create sliding window causal mask
+        # Causal mask
         q_len = q.size(2)
         kv_len = k.size(2)
-
-        # Start with causal mask (upper triangle = -inf)
         causal_mask = torch.triu(
             torch.full((q_len, kv_len), float('-inf'), device=x.device, dtype=x.dtype),
-            diagonal=1
+            diagonal=kv_len - q_len + 1
         )
-
-        # Add sliding window constraint (vectorized)
-        # Each position i can only attend to positions max(0, i - window_size + 1) to i
-        if self.window_size < kv_len:
-            # Create row and column indices
-            row_idx = torch.arange(q_len, device=x.device).unsqueeze(1)
-            col_idx = torch.arange(kv_len, device=x.device).unsqueeze(0)
-            # Mask where column is before the window start for each row
-            window_mask = col_idx < (row_idx - self.window_size + 1)
-            causal_mask = causal_mask.masked_fill(window_mask, float('-inf'))
-
         attn_weights = attn_weights + causal_mask
 
+        # Softmax and apply to values
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(x.dtype)
         attn_weights = self.dropout(attn_weights)
 
-        # Apply attention to values
         output = torch.matmul(attn_weights, v)
 
         # Reshape and project output
@@ -470,121 +276,103 @@ class SlidingWindowGQA(nn.Module):
         return output, new_cache
 
 
-class ChimeraBlock(nn.Module):
+class TransformerBlock(nn.Module):
     """
-    Single Chimera block - either recurrent or attention based.
+    Single Transformer block.
 
-    Pattern: Pre-norm residual with either:
-    - Gated Linear Recurrence (for global context)
-    - Sliding Window GQA (for local precision)
+    Architecture (Pre-Norm):
+        x -> RMSNorm -> Attention -> + -> RMSNorm -> FFN -> +
+        |___________________________|  |___________________|
+                  residual                   residual
 
-    Both followed by SwiGLU FFN.
+    Pre-norm is more stable for deep networks than post-norm.
     """
 
-    def __init__(self, config: ChimeraConfig, use_attention: bool):
+    def __init__(self, config: TransformerConfig):
         super().__init__()
-        self.use_attention = use_attention
-
-        self.norm1 = RMSNorm(config.d_model, config.rms_norm_eps)
-
-        if use_attention:
-            self.temporal_mix = SlidingWindowGQA(config)
-        else:
-            self.temporal_mix = GatedLinearRecurrence(config.d_model)
-
-        self.norm2 = RMSNorm(config.d_model, config.rms_norm_eps)
+        self.attention_norm = RMSNorm(config.d_model, config.rms_norm_eps)
+        self.attention = Attention(config)
+        self.ffn_norm = RMSNorm(config.d_model, config.rms_norm_eps)
         self.ffn = SwiGLU(config.d_model, config.ffn_hidden, config.dropout)
 
-    def forward(self, x: torch.Tensor,
-                cache: Optional[torch.Tensor] = None,
-                position_offset: int = 0,
-                use_cache: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        position_offset: int = 0,
+        use_cache: bool = False
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Forward pass through the block.
 
         Args:
             x: Input tensor [batch, seq_len, d_model]
-            cache: Previous state (KV cache for attention, hidden state for recurrence)
+            cache: KV-cache from previous steps
             position_offset: Position offset for RoPE
-            use_cache: Whether to return cache for next step
+            use_cache: Whether to return updated cache
 
         Returns:
             output: [batch, seq_len, d_model]
             new_cache: Updated cache if use_cache else None
         """
-        # Temporal mixing (attention or recurrence)
+        # Attention with residual
         residual = x
-        x = self.norm1(x)
-
-        if self.use_attention:
-            x, new_cache = self.temporal_mix(x, cache, position_offset, use_cache)
-        else:
-            # Use parallel scan during training for efficiency
-            # Use sequential with cache during inference
-            if self.training and not use_cache:
-                x = self.temporal_mix.forward_parallel(x)
-                new_cache = None
-            else:
-                x, new_cache = self.temporal_mix(x, cache, use_cache)
-
+        x = self.attention_norm(x)
+        x, new_cache = self.attention(x, cache, position_offset, use_cache)
         x = residual + x
 
-        # FFN
+        # FFN with residual
         residual = x
-        x = self.norm2(x)
+        x = self.ffn_norm(x)
         x = self.ffn(x)
         x = residual + x
 
         return x, new_cache
 
 
-class Chimera(nn.Module):
+class Transformer(nn.Module):
     """
-    Chimera: Hybrid Recurrent-Attention Language Model
+    Decoder-only Transformer Language Model.
 
-    A novel architecture combining:
-    - Gated linear recurrence for efficient global context (O(1) memory)
-    - Sliding window GQA for local retrieval precision
+    A clean implementation following modern best practices:
+    - Pre-norm with RMSNorm
+    - RoPE position encoding
     - SwiGLU FFN
-    - RoPE position embeddings
+    - Optional GQA for efficiency
+    - Weight tying
 
-    Layer pattern: Every Nth layer uses attention, others use recurrence.
-    Default: 3:1 ratio (recurrence:attention) proven effective in Griffin/Jamba.
+    This is the architecture that powers GPT, Llama, Mistral, etc.
     """
 
-    def __init__(self, config: ChimeraConfig):
+    def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
 
-        # Token embeddings
+        # Token embedding
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
 
-        # Build layers with recurrence/attention pattern
-        self.layers = nn.ModuleList()
-        for i in range(config.n_layers):
-            # Place attention every N layers (e.g., layers 2, 5, 8, 11... for N=3)
-            use_attention = (i + 1) % config.attention_every_n == 0
-            self.layers.append(ChimeraBlock(config, use_attention))
+        # Transformer blocks
+        self.layers = nn.ModuleList([
+            TransformerBlock(config) for _ in range(config.n_layers)
+        ])
 
-        # Final norm and output projection
+        # Final norm and output
         self.norm = RMSNorm(config.d_model, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
-        # Weight tying (reduces params, standard practice)
+        # Weight tying
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
 
         # Initialize weights
         self.apply(self._init_weights)
 
-        # Print architecture summary
-        n_attention = sum(1 for l in self.layers if l.use_attention)
-        n_recurrent = config.n_layers - n_attention
-        print(f"Chimera initialized: {config.n_layers} layers "
-              f"({n_recurrent} recurrent, {n_attention} attention)")
+        # Print summary
+        print(f"Transformer initialized: {config.n_layers} layers, "
+              f"d_model={config.d_model}, heads={config.n_heads}")
 
     def _init_weights(self, module: nn.Module):
-        """Initialize weights following GPT-2 style."""
+        """Initialize weights with small normal distribution."""
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -592,19 +380,21 @@ class Chimera(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self,
-                input_ids: torch.Tensor,
-                cache: Optional[list] = None,
-                position_offset: int = 0,
-                use_cache: bool = False) -> Tuple[torch.Tensor, Optional[list]]:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        cache: Optional[list] = None,
+        position_offset: int = 0,
+        use_cache: bool = False
+    ) -> Tuple[torch.Tensor, Optional[list]]:
         """
-        Forward pass through Chimera.
+        Forward pass through the model.
 
         Args:
             input_ids: Token IDs [batch, seq_len]
-            cache: List of layer caches for inference
-            position_offset: Position offset for RoPE
-            use_cache: Whether to return caches
+            cache: List of KV-caches for each layer
+            position_offset: Position offset for cached inference
+            use_cache: Whether to return updated caches
 
         Returns:
             logits: [batch, seq_len, vocab_size]
@@ -634,115 +424,105 @@ class Chimera(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+# Backward compatibility alias
+Chimera = Transformer
+ChimeraBlock = TransformerBlock
+
+
 # ============================================================================
 # Model Size Configurations
 # ============================================================================
 
-def chimera_small() -> ChimeraConfig:
-    """~125M params - for testing and small experiments."""
-    return ChimeraConfig(
-        d_model=768,
-        n_layers=12,
-        n_heads=12,
-        n_kv_heads=4,
+def transformer_small() -> TransformerConfig:
+    """~85M params - for testing and quick experiments."""
+    return TransformerConfig(
+        d_model=512,
+        n_layers=8,
+        n_heads=8,
+        n_kv_heads=8,  # Standard MHA
         vocab_size=32000,
+        max_seq_len=2048,
     )
 
-def chimera_medium() -> ChimeraConfig:
-    """~350M params - for development."""
-    return ChimeraConfig(
+
+def transformer_medium() -> TransformerConfig:
+    """~350M params - for development and Colab training."""
+    return TransformerConfig(
         d_model=1024,
         n_layers=16,
         n_heads=16,
-        n_kv_heads=4,
-        vocab_size=32000,
-    )
-
-def chimera_base() -> ChimeraConfig:
-    """~1.5B params - main model for laptop deployment."""
-    return ChimeraConfig(
-        d_model=2048,
-        n_layers=24,
-        n_heads=16,
-        n_kv_heads=4,
-        vocab_size=32000,
-    )
-
-def chimera_large() -> ChimeraConfig:
-    """~3B params - for stronger performance with more VRAM."""
-    return ChimeraConfig(
-        d_model=2560,
-        n_layers=32,
-        n_heads=20,
-        n_kv_heads=4,
-        vocab_size=32000,
-    )
-
-
-def chimera_deep() -> ChimeraConfig:
-    """
-    ~135M params - Deep architecture for creative writing (laptop-optimized).
-
-    16 layers with moderate width (704 d_model).
-    Optimized for:
-    - 6GB VRAM (RTX 4050 laptop)
-    - ~5GB peak memory leaves headroom
-    - Style/voice development with good depth
-    - Verbose, eloquent prose generation
-
-    Layer pattern: 12 recurrent + 4 attention (3:1 ratio)
-    """
-    return ChimeraConfig(
-        d_model=704,
-        n_layers=16,
-        n_heads=11,  # 704/11 = 64 head_dim
-        n_kv_heads=1,  # Aggressive GQA for memory
+        n_kv_heads=4,  # GQA for efficiency
         vocab_size=32000,
         max_seq_len=2048,
-        sliding_window=512,
-        attention_every_n=4,
     )
 
 
-def chimera_abyss() -> ChimeraConfig:
-    """
-    ~2.1B params - EXTREME DEPTH for A100 80GB creative writing.
-
-    96 layers with solid width (1280 d_model).
-    This is the deepest Chimera variant - pure vertical scaling.
-
-    Optimized for:
-    - A100 80GB VRAM (~40-50GB peak usage, plenty of headroom)
-    - Maximum depth for complex reasoning chains
-    - Rich stylistic development across many layers
-    - Nuanced, eloquent prose with deep representations
-
-    Layer pattern: 72 recurrent + 24 attention (3:1 ratio)
-    - Recurrent layers: global context, style, voice
-    - Attention layers: local precision, coherence
-    """
-    return ChimeraConfig(
-        d_model=1280,
-        n_layers=96,
-        n_heads=20,       # 1280/20 = 64 head_dim
-        n_kv_heads=5,     # 4:1 GQA ratio
+def transformer_base() -> TransformerConfig:
+    """~1B params - for serious training."""
+    return TransformerConfig(
+        d_model=1536,
+        n_layers=24,
+        n_heads=24,
+        n_kv_heads=6,  # GQA
         vocab_size=32000,
-        max_seq_len=8192, # Long context for A100
-        sliding_window=2048,
-        attention_every_n=4,
+        max_seq_len=4096,
+    )
+
+
+def transformer_large() -> TransformerConfig:
+    """~3B params - for high-quality results."""
+    return TransformerConfig(
+        d_model=2048,
+        n_layers=32,
+        n_heads=32,
+        n_kv_heads=8,  # GQA
+        vocab_size=32000,
+        max_seq_len=4096,
+    )
+
+
+# Backward compatibility aliases
+chimera_small = transformer_small
+chimera_medium = transformer_medium
+chimera_base = transformer_base
+chimera_large = transformer_large
+
+
+def chimera_deep() -> TransformerConfig:
+    """~150M params - deep but narrow for laptop training."""
+    return TransformerConfig(
+        d_model=640,
+        n_layers=20,
+        n_heads=10,
+        n_kv_heads=2,  # Aggressive GQA
+        vocab_size=32000,
+        max_seq_len=2048,
+    )
+
+
+def chimera_abyss() -> TransformerConfig:
+    """~2B params - large model for A100 training."""
+    return TransformerConfig(
+        d_model=2048,
+        n_layers=32,
+        n_heads=32,
+        n_kv_heads=8,
+        vocab_size=32000,
+        max_seq_len=8192,
     )
 
 
 if __name__ == "__main__":
-    # Quick test
-    print("Testing Chimera architecture...")
+    print("=" * 60)
+    print("Testing Transformer Architecture")
+    print("=" * 60)
 
-    config = chimera_small()
-    model = Chimera(config)
+    config = transformer_small()
+    model = Transformer(config)
 
-    # Count parameters
     num_params = model.get_num_params()
-    print(f"Total parameters: {num_params:,} ({num_params/1e6:.1f}M)")
+    print(f"\nTotal parameters: {num_params:,} ({num_params/1e6:.1f}M)")
+    print(f"Config: d_model={config.d_model}, layers={config.n_layers}, heads={config.n_heads}")
 
     # Test forward pass
     batch_size, seq_len = 2, 128
@@ -751,6 +531,17 @@ if __name__ == "__main__":
     with torch.no_grad():
         logits, _ = model(input_ids)
 
-    print(f"Input shape: {input_ids.shape}")
+    print(f"\nInput shape: {input_ids.shape}")
     print(f"Output shape: {logits.shape}")
     print("Forward pass successful!")
+
+    # Test with cache (inference mode)
+    print("\nTesting cached inference...")
+    with torch.no_grad():
+        # First token
+        logits, cache = model(input_ids[:, :1], use_cache=True)
+        # Next tokens
+        for i in range(1, 5):
+            logits, cache = model(input_ids[:, i:i+1], cache=cache,
+                                  position_offset=i, use_cache=True)
+    print("Cached inference successful!")

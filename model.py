@@ -302,37 +302,38 @@ class GatedLinearRecurrence(nn.Module):
     def _parallel_scan(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         """
         Parallel scan for linear recurrence: h_t = a_t * h_{t-1} + b_t
-        
+
         Uses the associative property: (a1, b1) ⊗ (a2, b2) = (a1*a2, a2*b1 + b2)
-        
-        This implementation uses a simple chunked approach that's memory-efficient
-        and still much faster than pure sequential for long sequences.
+
+        IMPORTANT: Must use float32 internally - bf16 loses precision over long
+        sequences when computing cumulative products (0.99^2048 ≈ 1e-9).
         """
-        batch_size, seq_len, hidden_dim = a.shape
-        
-        # For short sequences, use cumsum approximation (fast, slightly approximate)
-        # For very long sequences, could implement full parallel scan
-        
+        orig_dtype = a.dtype
+
+        # Cast to float32 for numerical stability
+        a = a.float()
+        b = b.float()
+
         # Compute cumulative product of a in log-space for stability
         log_a = torch.log(a + 1e-8)
         cumsum_log_a = torch.cumsum(log_a, dim=1)
         a_cumulative = torch.exp(cumsum_log_a)  # [batch, seq, hidden]
-        
+
         # Scale inputs by inverse cumulative product, cumsum, then rescale
         # h_t = sum_{i=1}^{t} (prod_{j=i+1}^{t} a_j) * b_i
         #     = a_cumulative_t * sum_{i=1}^{t} b_i / a_cumulative_i
-        
+
         # Compute b / a_cumulative (shifted by 1 for correct indexing)
         a_cumulative_safe = a_cumulative + 1e-8
         scaled_b = b / a_cumulative_safe
-        
+
         # Cumulative sum of scaled inputs
         cumsum_scaled = torch.cumsum(scaled_b, dim=1)
-        
+
         # Rescale by cumulative product
         output = cumsum_scaled * a_cumulative
-        
-        return output
+
+        return output.to(orig_dtype)
 
 
 class SlidingWindowGQA(nn.Module):

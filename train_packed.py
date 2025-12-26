@@ -245,14 +245,28 @@ class Trainer:
         input_ids = batch["input_ids"].to(self.device)
         labels = batch["labels"].to(self.device)
 
+        # Check if model supports Multi-Token Prediction
+        use_mtp = hasattr(self.model, 'n_predict') and self.model.n_predict > 1
+
         # Forward pass
         with self.autocast_ctx:
-            logits, _ = self.model(input_ids)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
-                ignore_index=-100,
-            )
+            if use_mtp:
+                # Multi-Token Prediction: get all prediction heads
+                logits, mtp_logits, _ = self.model(input_ids, return_mtp_logits=True)
+                primary_loss, mtp_loss = self.model.compute_mtp_loss(
+                    logits, mtp_logits, labels, ignore_index=-100
+                )
+                mtp_weight = getattr(self.model.config, 'mtp_loss_weight', 1.0)
+                loss = primary_loss + mtp_weight * mtp_loss
+            else:
+                # Standard next-token prediction
+                logits, _ = self.model(input_ids)
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1),
+                    ignore_index=-100,
+                )
+
             loss = loss / self.config.gradient_accumulation_steps
 
         # Backward pass

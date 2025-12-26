@@ -139,6 +139,11 @@ class FUUMSparkConfig:
     attention_mode: AttentionMode = AttentionMode.DIFFERENTIAL
     diff_lambda_init: float = 0.1  # Initial noise cancellation strength
 
+    # Multi-Token Prediction (MTP) configuration
+    n_predict_tokens: int = 1  # 1 = standard NTP, 2+ = MTP (DeepSeek V3 uses 2)
+    mtp_loss_weight: float = 1.0  # Weight for auxiliary prediction heads
+    mtp_share_head: bool = False  # Share weights between prediction heads
+
     # Initialization
     init_std: float = 0.02
 
@@ -1198,13 +1203,15 @@ class FUUMSparkBlock(nn.Module):
 
 class FUUMSpark(nn.Module):
     """
-    FUUM Spark 1: Fast Unified Universal Memory Language Model
+    Wyrd Tanka 1: Fast Unified Universal Memory Language Model
 
     A novel hybrid architecture combining:
     1. Surprise-Gated Delta Recurrence (SGDR) for efficient O(1) memory
     2. Differential Attention for noise-cancelled local retrieval
     3. Hierarchical Adaptive Memory (HAM) for multi-timescale context
-    4. 3:1 recurrence:attention ratio (proven in Jamba/Griffin)
+    4. Latent Fold Memory (LFM) for hierarchical context compression
+    5. Multi-Token Prediction (MTP) for improved training and faster inference
+    6. 3:1 recurrence:attention ratio (proven in Jamba/Griffin)
 
     Target: Efficient inference on consumer hardware while matching
     frontier model quality on long-context tasks.
@@ -1223,13 +1230,30 @@ class FUUMSpark(nn.Module):
             use_attention = (i + 1) % config.attention_every_n == 0
             self.layers.append(FUUMSparkBlock(config, use_attention))
 
-        # Final norm and LM head
+        # Final norm and LM head (primary: predicts token t+1)
         self.norm = RMSNorm(config.d_model, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         # Weight tying
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
+
+        # Multi-Token Prediction heads (predicts tokens t+2, t+3, ...)
+        self.n_predict = config.n_predict_tokens
+        if self.n_predict > 1:
+            self.mtp_heads = nn.ModuleList()
+            for i in range(self.n_predict - 1):
+                if config.mtp_share_head:
+                    # Share weights with primary head
+                    self.mtp_heads.append(self.lm_head)
+                else:
+                    # Independent heads with small projection
+                    head = nn.Sequential(
+                        nn.Linear(config.d_model, config.d_model, bias=False),
+                        nn.SiLU(),
+                        nn.Linear(config.d_model, config.vocab_size, bias=False),
+                    )
+                    self.mtp_heads.append(head)
 
         # Initialize
         self.apply(self._init_weights)
@@ -1239,12 +1263,13 @@ class FUUMSpark(nn.Module):
         n_memory = config.n_layers - n_attention
         memory_type = config.memory_mode.value.upper()
         attn_type = "Differential" if config.attention_mode == AttentionMode.DIFFERENTIAL else "Standard"
+        mtp_str = f", MTP={self.n_predict}" if self.n_predict > 1 else ""
 
         print(f"{'='*60}")
-        print(f"FUUM Spark 1 Initialized")
+        print(f"Wyrd Tanka 1 Initialized")
         print(f"{'='*60}")
         print(f"  Layers: {config.n_layers} ({n_memory} {memory_type}, {n_attention} {attn_type} Attn)")
-        print(f"  d_model: {config.d_model}, d_state: {config.d_state}")
+        print(f"  d_model: {config.d_model}, d_state: {config.d_state}{mtp_str}")
         print(f"  Heads: {config.n_heads} (KV: {config.n_kv_heads})")
         print(f"  Parameters: {self.get_num_params():,} ({self.get_num_params()/1e6:.1f}M)")
         print(f"{'='*60}")
@@ -1262,20 +1287,27 @@ class FUUMSpark(nn.Module):
         input_ids: torch.Tensor,
         cache: Optional[List] = None,
         position_offset: int = 0,
-        use_cache: bool = False
-    ) -> Tuple[torch.Tensor, Optional[List]]:
+        use_cache: bool = False,
+        return_mtp_logits: bool = False
+    ) -> Union[Tuple[torch.Tensor, Optional[List]], Tuple[torch.Tensor, List[torch.Tensor], Optional[List]]]:
         """
-        Forward pass through FUUM Spark.
+        Forward pass through Wyrd Tanka.
 
         Args:
             input_ids: Token IDs [batch, seq_len]
             cache: List of layer caches for inference
             position_offset: Position offset for RoPE
             use_cache: Whether to return caches
+            return_mtp_logits: Whether to return MTP auxiliary logits
 
         Returns:
-            logits: [batch, seq_len, vocab_size]
-            new_cache: List of updated caches if use_cache
+            If return_mtp_logits=False:
+                logits: [batch, seq_len, vocab_size]
+                new_cache: List of updated caches if use_cache
+            If return_mtp_logits=True:
+                logits: [batch, seq_len, vocab_size] (primary head, t+1)
+                mtp_logits: List of [batch, seq_len, vocab_size] for t+2, t+3, ...
+                new_cache: List of updated caches if use_cache
         """
         x = self.embed_tokens(input_ids)
 
@@ -1290,7 +1322,61 @@ class FUUMSpark(nn.Module):
         x = self.norm(x)
         logits = self.lm_head(x)
 
+        if return_mtp_logits and self.n_predict > 1:
+            mtp_logits = []
+            for head in self.mtp_heads:
+                mtp_logits.append(head(x))
+            return logits, mtp_logits, new_cache
+
         return logits, new_cache
+
+    def compute_mtp_loss(
+        self,
+        logits: torch.Tensor,
+        mtp_logits: List[torch.Tensor],
+        labels: torch.Tensor,
+        ignore_index: int = -100
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute Multi-Token Prediction loss.
+
+        Args:
+            logits: Primary head logits [batch, seq_len, vocab_size]
+            mtp_logits: List of auxiliary head logits
+            labels: Target token IDs [batch, seq_len]
+            ignore_index: Token ID to ignore in loss computation
+
+        Returns:
+            primary_loss: Loss for primary head (next token prediction)
+            mtp_loss: Combined loss from auxiliary heads
+        """
+        batch, seq_len, vocab_size = logits.shape
+
+        # Primary loss: predict token at position t+1
+        primary_loss = F.cross_entropy(
+            logits[:, :-1].reshape(-1, vocab_size),
+            labels[:, 1:].reshape(-1),
+            ignore_index=ignore_index
+        )
+
+        # MTP losses: predict tokens at positions t+2, t+3, ...
+        mtp_losses = []
+        for i, aux_logits in enumerate(mtp_logits):
+            offset = i + 2  # Head i predicts token at t+offset
+            if seq_len > offset:
+                aux_loss = F.cross_entropy(
+                    aux_logits[:, :-offset].reshape(-1, vocab_size),
+                    labels[:, offset:].reshape(-1),
+                    ignore_index=ignore_index
+                )
+                mtp_losses.append(aux_loss)
+
+        if mtp_losses:
+            mtp_loss = torch.stack(mtp_losses).mean()
+        else:
+            mtp_loss = torch.tensor(0.0, device=logits.device)
+
+        return primary_loss, mtp_loss
 
     def get_num_params(self, non_embedding: bool = False) -> int:
         """Return total number of parameters."""
@@ -1418,6 +1504,48 @@ def wyrd_tanka_fold_base() -> FUUMSparkConfig:
     )
 
 
+# === Wyrd Tanka 1: Full Configuration (LFM + MTP) ===
+
+def wyrd_tanka_1_small() -> FUUMSparkConfig:
+    """~150M params with Latent Fold Memory + Multi-Token Prediction."""
+    return FUUMSparkConfig(
+        d_model=768,
+        n_layers=12,
+        n_heads=12,
+        n_kv_heads=4,
+        d_state=64,
+        memory_mode=MemoryMode.LATENT_FOLD,
+        attention_mode=AttentionMode.DIFFERENTIAL,
+        # Latent Fold Memory
+        n_folds=4,
+        fold_compression_ratio=2,
+        fold_base_decay=0.9,
+        # Multi-Token Prediction (DeepSeek V3 style)
+        n_predict_tokens=2,
+        mtp_loss_weight=1.0,
+    )
+
+
+def wyrd_tanka_1_base() -> FUUMSparkConfig:
+    """~1.5B params with Latent Fold Memory + Multi-Token Prediction."""
+    return FUUMSparkConfig(
+        d_model=2048,
+        n_layers=24,
+        n_heads=16,
+        n_kv_heads=4,
+        d_state=128,
+        memory_mode=MemoryMode.LATENT_FOLD,
+        attention_mode=AttentionMode.DIFFERENTIAL,
+        # Latent Fold Memory
+        n_folds=4,
+        fold_compression_ratio=2,
+        fold_base_decay=0.9,
+        # Multi-Token Prediction
+        n_predict_tokens=2,
+        mtp_loss_weight=1.0,
+    )
+
+
 # =============================================================================
 # Testing
 # =============================================================================
@@ -1505,6 +1633,30 @@ if __name__ == "__main__":
     print(f"  Output: {logits_fold.shape}")
     print(f"  Cache layers: {len(cache_fold)}")
     print("  ✓ Wyrd Tanka 1 (Latent Fold) OK\n")
+
+    print("Testing Multi-Token Prediction (MTP)...")
+    config_mtp = wyrd_tanka_1_small()
+    model_mtp = FUUMSpark(config_mtp)
+    input_ids_mtp = torch.randint(0, config_mtp.vocab_size, (batch_size, seq_len))
+    with torch.no_grad():
+        logits_mtp, mtp_logits, cache_mtp = model_mtp(
+            input_ids_mtp, use_cache=True, return_mtp_logits=True
+        )
+    print(f"  Input: {input_ids_mtp.shape}")
+    print(f"  Primary logits (t+1): {logits_mtp.shape}")
+    print(f"  MTP heads: {len(mtp_logits)}")
+    for i, aux in enumerate(mtp_logits):
+        print(f"    Head {i+1} (t+{i+2}): {aux.shape}")
+    print("  ✓ Multi-Token Prediction OK\n")
+
+    print("Testing MTP Loss Computation...")
+    labels = torch.randint(0, config_mtp.vocab_size, (batch_size, seq_len))
+    primary_loss, mtp_loss = model_mtp.compute_mtp_loss(logits_mtp, mtp_logits, labels)
+    total_loss = primary_loss + config_mtp.mtp_loss_weight * mtp_loss
+    print(f"  Primary loss: {primary_loss.item():.4f}")
+    print(f"  MTP loss: {mtp_loss.item():.4f}")
+    print(f"  Total loss: {total_loss.item():.4f}")
+    print("  ✓ MTP Loss Computation OK\n")
 
     print("="*70)
     print("All tests passed! Wyrd Tanka 1 is ready.")
